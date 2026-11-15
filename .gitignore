@@ -1,0 +1,8 @@
+node_modules/
+*.log
+*.log.1
+hmac_secret
+*secret*
+*session*
+*.pem
+.env

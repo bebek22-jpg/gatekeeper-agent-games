@@ -1,0 +1,16 @@
+# Render free-tier deploy for the Gatekeeper endpoint (fallback if pinggy's
+# 60-min cap blocks scored rounds). Copy this file to the repo root as
+# render.yaml when creating the deploy repo.
+services:
+  - type: web
+    name: bebek22-gatekeeper
+    env: node
+    plan: free
+    branch: main
+    rootDir: gatekeeper
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: HMAC_SECRET
+        sync: false # set in the Render dashboard (secret) — never in the repo
