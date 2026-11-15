@@ -1,12 +1,18 @@
 'use strict';
 // Shared input handling for the zkVerify Agent Games Proof Gatekeeper endpoint.
 //
-// The platform's exact task-envelope schema is unknown until practice mode
-// reveals it, so extraction is deliberately flexible: fields are searched at
-// the top level and under common nests, and values may be hex strings,
-// decimal strings, or JSON numbers.
+// Schema per https://agentgames.zkverify.io/build (read 2026-11-15):
+// task envelope { type: "agent-games.proof-gatekeeper.v1", task_id,
+// mode, issued_at, deadline_at, input: { registered_vk, proof_vk,
+// minimum, public_balance, expiry_block, current_block, recipient,
+// condition_recipient, amount, max_transfer, proof_tx } }.
+// Preflight: { type: "agent-games.preflight.v1", agent_id, issued_at,
+// nonce } -> respond { ok: true, protocolVersion: "v1" }.
+// Extraction stays defensive (aliases + nests) in case the live envelope
+// differs slightly from the doc; values may be hex strings, decimal
+// strings, or JSON numbers.
 //
-// Fail-closed throughout: anything missing or unparseable -> decision 0.
+// Fail-closed throughout: anything missing or unparseable -> REJECT.
 
 const path = require('path');
 const crypto = require('crypto');
@@ -80,6 +86,22 @@ function randomSalt() {
   return BigInt('0x' + crypto.randomBytes(8).toString('hex')).toString(10);
 }
 
+// Map a task id to a circuit field element. Real task ids are strings
+// like "gk_8d31_..." — not numbers. Numeric ids pass through; anything
+// else is SHA-256 hashed (Node has no keccak256 built in) and reduced
+// mod p. Deterministic per task id. If practice shows the platform
+// expects a different mapping (e.g. keccak), change this one function.
+function taskIdToField(taskId) {
+  if (taskId === undefined || taskId === null) return '0';
+  const asNum = toBigInt(taskId);
+  if (asNum !== null) return (asNum % BN128_PRIME).toString(10);
+  const hash = crypto
+    .createHash('sha256')
+    .update(String(taskId), 'utf8')
+    .digest('hex');
+  return (BigInt('0x' + hash) % BN128_PRIME).toString(10);
+}
+
 // ---------------------------------------------------------------------------
 // Envelope extraction
 // ---------------------------------------------------------------------------
@@ -101,21 +123,37 @@ const FIELD_ALIASES = {
   expiryBlock: ['expiryBlock', 'expiry_block', 'expiry', 'expirationBlock'],
   currentBlock: ['currentBlock', 'current_block', 'blockNumber', 'block_number'],
   taskId: ['taskId', 'task_id', 'id'],
-  vkHash: [
+  // The real envelope carries TWO vk hashes: registered_vk (the key the
+  // condition was registered under) and proof_vk (the key the transfer's
+  // proof was made with). Approve only when they match. A lone vkHash /
+  // vk / vk_hash is treated as the proof vk (compared against the known
+  // registered constant).
+  registeredVk: [
+    'registered_vk',
+    'registeredVk',
+    'registeredVkHash',
+    'registered_vk_hash',
+    'registeredKeyHash',
+  ],
+  proofVk: [
+    'proof_vk',
+    'proofVk',
+    'proofVkHash',
+    'proof_vk_hash',
     'vkHash',
     'vk_hash',
-    'registeredVkHash',
-    'proofVkHash',
     'verificationKeyHash',
     'vk',
   ],
+  proofTx: ['proof_tx', 'proofTx'],
 };
 
 // Candidate scopes, in search order: top level, then one level of common
 // nests, then two levels for the most likely nest combos.
 function candidateScopes(envelope) {
   const scopes = [envelope];
-  const nests = ['task', 'condition', 'data', 'payload', 'publicInputs', 'inputs'];
+  // The documented envelope nests all condition fields under `input`.
+  const nests = ['input', 'task', 'condition', 'data', 'payload', 'publicInputs', 'inputs'];
   const first = [];
   for (const n of nests) {
     const v = envelope && typeof envelope === 'object' ? envelope[n] : undefined;
@@ -162,12 +200,15 @@ function extractFields(envelope) {
 // ---------------------------------------------------------------------------
 
 // Approve (1) ONLY if every check holds. Any missing/unparseable field, any
-// failed check -> reject (0). Returns { decision, reasons[] }.
+// failed check -> reject (0). Returns { decision, reasonCode, reasons[] }.
+// Reason codes: VALID_CONDITION + the documented trap codes
+// (VK_SUBSTITUTION, THRESHOLD_MISMATCH, RECIPIENT_MISMATCH) + AMOUNT_EXCEEDED,
+// EXPIRED, INVALID_INPUT for the remaining failure modes.
 function decide(fields) {
   const reasons = [];
-  const fail = (why) => {
+  const fail = (reasonCode, why) => {
     reasons.push(why);
-    return { decision: 0, reasons };
+    return { decision: 0, reasonCode, reasons };
   };
 
   const minimum = toBigInt(fields.minimum);
@@ -190,27 +231,39 @@ function decide(fields) {
     currentBlock,
   };
   for (const [name, parsed] of Object.entries(required)) {
-    if (parsed === null) return fail(`missing/unparseable field: ${name}`);
+    if (parsed === null)
+      return fail('INVALID_INPUT', `missing/unparseable field: ${name}`);
+  }
+
+  // vk check: proof_vk must equal registered_vk (mod-p reduced, because
+  // the 256-bit hashes exceed the field prime). When the envelope carries
+  // only proof_vk, compare against the known registered constant. When
+  // it carries neither, the check is skipped (legacy envelopes).
+  const proofVk = fields.proofVk;
+  if (proofVk !== undefined && proofVk !== null) {
+    const proofModP = hashModP(proofVk);
+    if (proofModP === null) return fail('INVALID_INPUT', 'unparseable proof_vk');
+    let registeredModP = REGISTERED_VK_HASH_MODP;
+    const registeredVk = fields.registeredVk;
+    if (registeredVk !== undefined && registeredVk !== null) {
+      registeredModP = hashModP(registeredVk);
+      if (registeredModP === null)
+        return fail('INVALID_INPUT', 'unparseable registered_vk');
+    }
+    if (proofModP !== registeredModP)
+      return fail('VK_SUBSTITUTION', 'proof_vk != registered_vk');
   }
 
   if (publicBalance < minimum)
-    return fail('publicBalance < minimum');
-  if (amount > maxTransfer) return fail('amount > maxTransfer');
+    return fail('THRESHOLD_MISMATCH', 'publicBalance < minimum');
   if (recipient !== conditionRecipient)
-    return fail('recipient != conditionRecipient');
+    return fail('RECIPIENT_MISMATCH', 'recipient != conditionRecipient');
+  if (amount > maxTransfer)
+    return fail('AMOUNT_EXCEEDED', 'amount > maxTransfer');
   if (expiryBlock <= currentBlock)
-    return fail('expiryBlock <= currentBlock');
+    return fail('EXPIRED', 'expiryBlock <= currentBlock');
 
-  // vk hash check, only when the envelope carries one. Compare mod-p
-  // reduced decimals because the 256-bit hash exceeds the field prime.
-  if (fields.vkHash !== undefined && fields.vkHash !== null) {
-    const got = hashModP(fields.vkHash);
-    if (got === null) return fail('unparseable vkHash');
-    if (got !== REGISTERED_VK_HASH_MODP)
-      return fail('vkHash != registered vk hash');
-  }
-
-  return { decision: 1, reasons };
+  return { decision: 1, reasonCode: 'VALID_CONDITION', reasons };
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +282,8 @@ function buildCircuitInput(fields, decision) {
   const conditionRecipient = toDecimalString(fields.conditionRecipient);
   const expiryBlock = toDecimalString(fields.expiryBlock);
   const currentBlock = toDecimalString(fields.currentBlock);
-  const taskId = toDecimalString(fields.taskId);
+  // taskId maps to a field element (string ids are hashed); never missing.
+  const taskId = taskIdToField(fields.taskId);
 
   const missing = [];
   if (minimum === null) missing.push('minimum');
@@ -240,26 +294,34 @@ function buildCircuitInput(fields, decision) {
   if (conditionRecipient === null) missing.push('conditionRecipient');
   if (expiryBlock === null) missing.push('expiryBlock');
   if (currentBlock === null) missing.push('currentBlock');
-  if (taskId === null) missing.push('taskId');
   if (missing.length > 0) {
     return { error: `cannot build circuit input, missing/unparseable: ${missing.join(', ')}` };
   }
 
-  // proofVkHash: the envelope's vk hash when present (even if it mismatches
-  // the registered one — the proof then attests the real inputs with
-  // decision 0; if the circuit refuses, proving fails and we answer
+  // registeredVkHash: the envelope's registered_vk when present (the
+  // condition's own key), else the known tournament constant.
+  // proofVkHash: the envelope's proof_vk when present — even if it
+  // mismatches the registered one (the proof then attests the real inputs
+  // with decision 0; if the circuit refuses, proving fails and we answer
   // decision 0 without a proof). Otherwise the registered hash.
-  const proofVkHash =
-    fields.vkHash !== undefined && fields.vkHash !== null
-      ? toDecimalString(fields.vkHash)
-      : REGISTERED_VK_HASH_DEC;
-  if (proofVkHash === null) {
-    return { error: 'cannot build circuit input, unparseable vkHash' };
+  let registeredVkHash = REGISTERED_VK_HASH_DEC;
+  if (fields.registeredVk !== undefined && fields.registeredVk !== null) {
+    registeredVkHash = toDecimalString(fields.registeredVk);
+    if (registeredVkHash === null) {
+      return { error: 'cannot build circuit input, unparseable registered_vk' };
+    }
+  }
+  let proofVkHash = registeredVkHash;
+  if (fields.proofVk !== undefined && fields.proofVk !== null) {
+    proofVkHash = toDecimalString(fields.proofVk);
+    if (proofVkHash === null) {
+      return { error: 'cannot build circuit input, unparseable proof_vk' };
+    }
   }
 
   return {
     input: {
-      registeredVkHash: REGISTERED_VK_HASH_DEC,
+      registeredVkHash,
       proofVkHash,
       minimum,
       publicBalance,
@@ -331,6 +393,7 @@ module.exports = {
   toDecimalString,
   hashModP,
   randomSalt,
+  taskIdToField,
   extractFields,
   decide,
   buildCircuitInput,

@@ -3,17 +3,26 @@
 //
 // Node.js, no framework (built-in http only).
 //
-// Flow per task:
+// Flow per request:
 //   1. Read the raw request body.
 //   2. Verify HMAC-SHA256 (header x-agent-games-signature) over the RAW body
 //      BEFORE parsing. Mismatch/missing -> 401, no further processing.
-//   3. Extract condition fields defensively, decide approve (1) / reject (0).
-//   4. Generate a Groth16 proof locally with snarkjs + the tournament
-//      circuit (decision 0 is also proven when the inputs allow it).
-//   5. Respond { decision, proof, publicSignals, taskId }, signed with the
-//      same HMAC secret over the raw response body.
+//   3. Preflight (type "agent-games.preflight.v1") -> respond
+//      { ok: true, protocolVersion: "v1" }, signed. No proving.
+//   4. Task: extract condition fields defensively, decide APPROVE / REJECT.
+//   5. Generate a Groth16 proof locally with snarkjs + the tournament
+//      circuit (REJECT is also proven when the inputs allow it).
+//   6. Respond { decision, reason_code, proof, public_signals, proof_tx? },
+//      signed with the same HMAC secret over the raw response body.
 //
-// Fail closed everywhere: any doubt -> decision 0, no proof, never crash,
+// Response schema per https://agentgames.zkverify.io/build:
+// decision is "APPROVE"/"REJECT" (strings); reason_code is one of
+// VALID_CONDITION, VK_SUBSTITUTION, THRESHOLD_MISMATCH,
+// RECIPIENT_MISMATCH, AMOUNT_EXCEEDED, EXPIRED, INVALID_INPUT (plus
+// TIMEOUT / PROVE_FAILED for internal failures). proof_tx echoes the
+// task's proof_tx when present.
+//
+// Fail closed everywhere: any doubt -> REJECT, no proof, never crash,
 // never hang (45s internal guard; platform deadline is 60s).
 //
 // Env:
@@ -30,7 +39,7 @@ const path = require('path');
 
 let snarkjs;
 try {
-  snarkjs = require('snarkjs'); // gatekeeper/node_modules after npm install
+  snarkjs = require('snarkjs'); // gatekeeper/node_modules -> ../node_modules
 } catch {
   snarkjs = require('../node_modules/snarkjs');
 }
@@ -152,7 +161,7 @@ async function handleTask(req, res, rawBody) {
   let responded = false;
   let taskIdEcho = null;
 
-  // 45s internal guard: force a decision-0 response if proving (or anything
+  // 45s internal guard: force a REJECT response if proving (or anything
   // else) is still stuck. Proving normally takes ~1.5s.
   const guard = setTimeout(() => {
     if (responded) return;
@@ -163,11 +172,10 @@ async function handleTask(req, res, rawBody) {
       responseMs: Date.now() - startedAt,
     });
     sendJson(res, 200, {
-      decision: 0,
+      decision: 'REJECT',
+      reason_code: 'TIMEOUT',
       proof: null,
-      publicSignals: null,
-      taskId: taskIdEcho,
-      error: 'internal timeout: decision 0 (fail closed)',
+      public_signals: null,
     });
   }, INTERNAL_TIMEOUT_MS);
 
@@ -205,47 +213,61 @@ async function handleTask(req, res, rawBody) {
     try {
       envelope = JSON.parse(rawBody.toString('utf8'));
     } catch (err) {
-      finish(400, {
-        decision: 0,
+      finish(200, {
+        decision: 'REJECT',
+        reason_code: 'INVALID_INPUT',
         proof: null,
-        publicSignals: null,
-        taskId: null,
-        error: 'invalid JSON envelope',
-      }, { hmac: 'ok', decision: 0, error: 'PARSE_FAIL' });
+        public_signals: null,
+      }, { hmac: 'ok', decision: 'REJECT', reasonCode: 'INVALID_INPUT', error: 'PARSE_FAIL' });
       return;
     }
     if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
-      finish(400, {
-        decision: 0,
+      finish(200, {
+        decision: 'REJECT',
+        reason_code: 'INVALID_INPUT',
         proof: null,
-        publicSignals: null,
-        taskId: null,
-        error: 'envelope must be a JSON object',
-      }, { hmac: 'ok', decision: 0, error: 'ENVELOPE_NOT_OBJECT' });
+        public_signals: null,
+      }, { hmac: 'ok', decision: 'REJECT', reasonCode: 'INVALID_INPUT', error: 'ENVELOPE_NOT_OBJECT' });
+      return;
+    }
+
+    // --- 2b. Preflight handshake (signed, no proving). ---
+    if (envelope.type === 'agent-games.preflight.v1') {
+      finish(200, { ok: true, protocolVersion: 'v1' }, {
+        hmac: 'ok',
+        event: 'PREFLIGHT',
+      });
       return;
     }
 
     // --- 3. Extract + decide. ---
     const fields = extractFields(envelope);
-    // Echo taskId exactly as received (string/number as-is).
+    // taskId kept for logging only (the response schema has no task id).
     taskIdEcho =
       fields.taskId !== undefined && fields.taskId !== null
         ? fields.taskId
         : null;
-    const { decision, reasons } = decide(fields);
+    const { decision, reasonCode, reasons } = decide(fields);
+    const decisionStr = decision === 1 ? 'APPROVE' : 'REJECT';
+    // Echo the task's proof_tx (optional on-chain audit pointer).
+    const proofTx =
+      fields.proofTx !== undefined && fields.proofTx !== null
+        ? fields.proofTx
+        : undefined;
 
     // --- 4. Build circuit input; prove when possible. ---
     const built = buildCircuitInput(fields, decision);
     if (built.error) {
       finish(200, {
-        decision: 0,
+        decision: 'REJECT',
+        reason_code: reasonCode,
         proof: null,
-        publicSignals: null,
-        taskId: taskIdEcho,
-        error: built.error,
+        public_signals: null,
+        ...(proofTx !== undefined ? { proof_tx: proofTx } : {}),
       }, {
         hmac: 'ok',
-        decision: 0,
+        decision: 'REJECT',
+        reasonCode,
         proof: false,
         reasons,
         error: 'INPUT_BUILD_FAIL',
@@ -264,46 +286,49 @@ async function handleTask(req, res, rawBody) {
     } catch (err) {
       const reason = String(err && err.message ? err.message : err).slice(0, 300);
       finish(200, {
-        decision: 0,
+        decision: 'REJECT',
+        reason_code: 'PROVE_FAILED',
         proof: null,
-        publicSignals: null,
-        taskId: taskIdEcho,
-        error: `proving failed: ${reason}`,
+        public_signals: null,
+        ...(proofTx !== undefined ? { proof_tx: proofTx } : {}),
       }, {
         hmac: 'ok',
-        decision: 0,
+        decision: 'REJECT',
+        reasonCode: 'PROVE_FAILED',
         proof: false,
         reasons,
         proveMs: Date.now() - proveStarted,
         error: 'PROVE_FAIL',
+        proveError: reason,
       });
       return;
     }
     const proveMs = Date.now() - proveStarted;
 
     finish(200, {
-      decision,
+      decision: decisionStr,
+      reason_code: reasonCode,
       proof: proofResult.proof,
-      publicSignals: proofResult.publicSignals.map(String),
-      taskId: taskIdEcho,
+      public_signals: proofResult.publicSignals.map(String),
+      ...(proofTx !== undefined ? { proof_tx: proofTx } : {}),
     }, {
       hmac: 'ok',
-      decision,
+      decision: decisionStr,
+      reasonCode,
       proof: true,
       proveMs,
       reasons: decision === 0 ? reasons : undefined,
-      vkPrefix: shortHash(fields.vkHash),
+      vkPrefix: shortHash(fields.proofVk),
     });
   } catch (err) {
     // Last-resort catch: never crash, never hang.
     const reason = String(err && err.message ? err.message : err).slice(0, 300);
     finish(200, {
-      decision: 0,
+      decision: 'REJECT',
+      reason_code: 'INVALID_INPUT',
       proof: null,
-      publicSignals: null,
-      taskId: taskIdEcho,
-      error: `internal error: ${reason}`,
-    }, { hmac: 'ok', decision: 0, proof: false, error: 'INTERNAL_ERROR' });
+      public_signals: null,
+    }, { hmac: 'ok', decision: 'REJECT', reasonCode: 'INVALID_INPUT', proof: false, error: 'INTERNAL_ERROR', detail: reason });
   }
 }
 
@@ -338,11 +363,10 @@ const server = http.createServer((req, res) => {
         console.error('[gatekeeper] handler error:', err);
         if (!res.writableEnded) {
           sendJson(res, 200, {
-            decision: 0,
+            decision: 'REJECT',
+            reason_code: 'INVALID_INPUT',
             proof: null,
-            publicSignals: null,
-            taskId: null,
-            error: 'internal error',
+            public_signals: null,
           });
         }
       });

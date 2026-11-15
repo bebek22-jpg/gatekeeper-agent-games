@@ -14,7 +14,7 @@ all within the platform's 60s hard deadline. Fail closed on any doubt.
 | `prove.js` | Standalone proving CLI (testing / debugging). |
 | `test_local.js` | Local end-to-end test suite (spawns the server, dummy secret). |
 | `endpoint.log` | JSON-lines request log (rotates >5MB to `endpoint.log.1`). |
-| `node_modules` | Created by `npm install` (snarkjs 0.7.6). |
+| `node_modules` | Symlink to `../node_modules` (snarkjs 0.7.6, reused — no install). |
 
 Circuit artifacts live in `../circuits/` (`gatekeeper.wasm`,
 `gatekeeper_final.zkey`, `verification_key.json`).
@@ -64,76 +64,128 @@ bytes **before** parsing; mismatch or missing header → `401`, nothing else
 happens.
 
 **Outgoing** — JSON, signed the same way (`x-agent-games-signature` header
-over the raw response body):
+over the raw response body). Schema per
+https://agentgames.zkverify.io/build:
 
 ```json
 {
-  "decision": 1,
+  "decision": "APPROVE",
+  "reason_code": "VALID_CONDITION",
   "proof": { "pi_a": ["...", "...", "1"], "pi_b": [[...]], "pi_c": ["...", "...", "1"], "protocol": "groth16", "curve": "bn128" },
-  "publicSignals": ["<commitment>", "<vkHash mod p>", "<vkHash mod p>", "1000", "1460", "8430000", "8420000", "<recipient>", "<conditionRecipient>", "500", "1000", "1", "1"],
-  "taskId": "1"
+  "public_signals": ["<commitment>", "<registeredVk mod p>", "<proofVk mod p>", "1000", "1460", "8430000", "8420000", "<recipient>", "<conditionRecipient>", "500", "1000", "1", "<taskId field>"],
+  "proof_tx": "0xa8...2c"
 }
 ```
 
-- `decision`: number `0` (reject) or `1` (approve).
+- `decision`: `"APPROVE"` or `"REJECT"` (strings).
+- `reason_code`: `VALID_CONDITION` on approve; on reject one of
+  `VK_SUBSTITUTION`, `THRESHOLD_MISMATCH`, `RECIPIENT_MISMATCH`,
+  `AMOUNT_EXCEEDED`, `EXPIRED`, `INVALID_INPUT` (plus `TIMEOUT` /
+  `PROVE_FAILED` for internal failures).
 - `proof`: the snarkjs proof object, or `null` when no proof could be
-  produced (then an `error` string field explains why).
-- `publicSignals`: 13 decimal strings, or `null` with no proof. Order:
-  commitment, vk hash (mod-p reduced, ×2), minimum, publicBalance,
-  expiryBlock, currentBlock, recipient, conditionRecipient, amount,
-  maxTransfer, decision, taskId. The salt is private (never in signals).
-- `taskId`: echoed exactly as received (string or number as-is).
+  produced (an omitted proof costs −2; a decision-0 proof is produced
+  whenever the numeric inputs allow it).
+- `public_signals`: 13 decimal strings, or `null` with no proof. Order:
+  commitment, registered vk hash (mod-p reduced), proof vk hash (mod-p
+  reduced), minimum, publicBalance, expiryBlock, currentBlock, recipient,
+  conditionRecipient, amount, maxTransfer, decision (0/1), taskId field.
+  The salt is private (never in signals).
+- `proof_tx`: echoes the task's `proof_tx` when present (optional
+  on-chain audit pointer); omitted otherwise.
+
+**Preflight** — the platform sends a signed
+`{"type": "agent-games.preflight.v1", "agent_id": "agt_...", "issued_at":
+"...", "nonce": "..."}` before any task. The endpoint must answer
+`{"ok": true, "protocolVersion": "v1"}` (signed, HTTP 200, within 10s).
+Preflight must pass before the platform marks the agent active. Detected
+by the `type` field after HMAC verification; no proving involved.
 
 ## Envelope fields expected
 
-The exact platform schema is unknown until practice mode reveals it, so
-extraction is defensive (see `input.js`): each field is searched at the top
-level and under the nests `task`, `condition`, `data`, `payload`,
-`publicInputs`, `inputs` (plus two-level combos like `task.condition`),
-under several alias spellings, and values may be hex strings (`0x…`),
-decimal strings, or JSON numbers.
+Real schema (per /build), with the condition fields nested under `input`:
+
+```json
+{
+  "type": "agent-games.proof-gatekeeper.v1",
+  "task_id": "gk_8d31_...",
+  "mode": "competition",
+  "issued_at": "<issued-at>",
+  "deadline_at": "<deadline-at>",
+  "input": {
+    "registered_vk": "0x7d...91",
+    "proof_vk": "0x13...aa",
+    "minimum": "1000",
+    "public_balance": "1460",
+    "expiry_block": 8430000,
+    "current_block": 8420000,
+    "recipient": "0xDe42...9f01",
+    "condition_recipient": "0xDe42...9f01",
+    "amount": "500",
+    "max_transfer": "1000",
+    "proof_tx": "0xa8...2c"
+  }
+}
+```
+
+Extraction stays defensive (see `input.js`): each field is searched at the
+top level and under the nests `input`, `task`, `condition`, `data`,
+`payload`, `publicInputs`, `inputs` (plus two-level combos), under several
+alias spellings, and values may be hex strings (`0x…`), decimal strings,
+or JSON numbers. A legacy flat camelCase envelope still works.
 
 | field | meaning | aliases searched |
 |---|---|---|
-| `minimum` | minimum required balance | `minBalance`, `min` |
-| `publicBalance` | public balance to check | `balance` |
-| `amount` | transfer amount | `transferAmount` |
-| `maxTransfer` | max allowed transfer | `maxAmount` |
+| `minimum` | minimum required balance | `minBalance`, `min_balance`, `min` |
+| `public_balance` | public balance to check | `publicBalance`, `balance` |
+| `amount` | transfer amount | `transferAmount`, `transfer_amount` |
+| `max_transfer` | max allowed transfer | `maxTransfer`, `maxAmount`, `max_amount` |
 | `recipient` | transfer recipient (address) | `to`, `destination` |
-| `conditionRecipient` | expected recipient | `expectedRecipient` |
-| `expiryBlock` | condition expiry block | `expiry`, `expirationBlock` |
-| `currentBlock` | current block | `blockNumber` |
-| `taskId` | task identifier (echoed; must be numeric to prove) | `id` |
-| `vkHash` | verification-key hash to check (optional) | `registeredVkHash`, `proofVkHash`, `verificationKeyHash`, `vk` |
+| `condition_recipient` | expected recipient | `conditionRecipient`, `expectedRecipient`, `expected_recipient` |
+| `expiry_block` | condition expiry block | `expiryBlock`, `expiry`, `expirationBlock` |
+| `current_block` | current block | `currentBlock`, `blockNumber`, `block_number` |
+| `task_id` | task identifier (string like `gk_...`; hashed to a field element — see below) | `taskId`, `id` |
+| `registered_vk` | vk the condition was registered under | `registeredVk`, `registeredVkHash`, `registered_vk_hash` |
+| `proof_vk` | vk the transfer's proof was made with | `proofVk`, `proofVkHash`, `proof_vk_hash`, `vkHash`, `vk_hash`, `vk` |
+| `proof_tx` | on-chain audit pointer (echoed back) | `proofTx` |
+
+**taskId mapping**: real task ids are non-numeric strings, but the circuit
+needs a field element. `taskIdToField()` passes numeric ids through and
+maps anything else via SHA-256 mod p (Node has no keccak256 built in).
+Deterministic per task id. If the platform ever rejects proofs over the
+taskId signal, this one function is where the mapping changes.
 
 ## Decision rules (fail closed)
 
-Approve (`decision: 1`) **only** if ALL hold:
+Approve (`"APPROVE"`, reason `VALID_CONDITION`) **only** if ALL hold:
 
-1. `publicBalance >= minimum`
-2. `amount <= maxTransfer`
-3. `recipient == conditionRecipient` (compared as integers, so hex vs decimal spellings match)
-4. `expiryBlock > currentBlock`
-5. if a vk hash is present in the envelope, it equals the registered
-   gatekeeper hash `0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0`
-   — compared **mod the BN254 field prime**, because the 256-bit hash
-   exceeds the prime and snarkjs reduces it (same reduction the circuit
-   applies).
+1. `proof_vk == registered_vk` — compared **mod the BN254 field prime**,
+   because the 256-bit hashes exceed the prime and snarkjs reduces them
+   (same reduction the circuit applies). When the envelope carries only
+   `proof_vk`, it is compared against the known registered gatekeeper hash
+   `0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0`.
+   Mismatch → `VK_SUBSTITUTION`.
+2. `public_balance >= minimum`, else `THRESHOLD_MISMATCH`
+3. `recipient == condition_recipient` (compared as integers, so hex vs
+   decimal spellings match), else `RECIPIENT_MISMATCH`
+4. `amount <= max_transfer`, else `AMOUNT_EXCEEDED`
+5. `expiry_block > current_block`, else `EXPIRED`
 
-Any missing/unparseable field → `decision: 0`. A decision-0 proof is still
-produced when all numeric inputs are present (the circuit accepts decision 0
-with mismatched recipients / wrong vk hash — verified in tests); if proving
-fails, the response is `decision: 0` with `proof: null` and an `error` note.
+Any missing/unparseable field → `"REJECT"` with `INVALID_INPUT`. A
+decision-0 proof is still produced when all numeric inputs are present
+(the circuit accepts decision 0 with mismatched inputs — verified in
+tests); if proving fails, the response is `"REJECT"` with `PROVE_FAILED`
+and `proof: null`.
 
 ## Timing / safety rails
 
 - Proving: ~1.1s cold (first prove in a fresh process), ~0.4s warm.
-- 45s internal guard forces a decision-0 response if anything stalls;
+- 45s internal guard forces a REJECT response if anything stalls;
   server `requestTimeout` is 55s (platform deadline is 60s).
 - Request body cap 1MB (`413` above).
 - Logs: JSON lines in `endpoint.log`, rotated at 5MB. Logs taskId,
-  hmac ok/fail, decision, prove/response ms, and only the first 8 chars of
-  any hash/signature. **Never logs the secret or full signature values.**
+  hmac ok/fail, decision, reasonCode, prove/response ms, and only the
+  first 8 chars of any hash/signature. **Never logs the secret or full
+  signature values.**
 
 ## Standalone proving
 
@@ -146,7 +198,9 @@ node prove.js envelope.json
 ```
 
 Prints `{ decision, proof, publicSignals, taskId, proveMs }` (+ `verified`
-with `--verify`). Exit 1 on any failure.
+with `--verify`). Exit 1 on any failure. (prove.js still uses the numeric
+0/1 decision and camelCase keys internally — the server maps to the
+platform's string/snake_case response shape.)
 
 Note: snarkjs leaves worker threads alive after proving, so `prove.js`
 calls `process.exit(0)` explicitly after printing. The workers are reused
@@ -155,29 +209,25 @@ across proves (thread count stays flat) — no leak in the long-lived server.
 ## Tests
 
 ```sh
-node test_local.js   # 12 checks, localhost only, dummy secret
+node test_local.js   # 15 checks, localhost only, dummy secret, port 3102
 ```
 
-Covers: valid envelope → decision 1 + proof that verifies against the vk;
-response-signature verification; wrong/missing HMAC → 401; recipient
-mismatch → decision 0 (with decision-0 proof); nested envelope; missing
-fields → decision 0 without proof; wrong vk hash → decision 0; health.
+Covers: health; preflight handshake; valid real-schema envelope →
+APPROVE/VALID_CONDITION + proof that verifies against the vk + proof_tx
+echo; response-signature verification; wrong/missing HMAC → 401; all five
+trap types → REJECT with the right reason code + decision-0 proof; missing
+fields → REJECT/INVALID_INPUT without proof; legacy flat envelope still
+works.
 
-## What to adjust once practice mode reveals the real schema
+## Open questions (for practice mode to settle)
 
-1. **Envelope shape** — if fields live under a nest or alias not covered,
-   add the nest to `candidateScopes()` / the alias to `FIELD_ALIASES` in
-   `input.js`, then re-run `test_local.js` with a real captured envelope.
-2. **Response shape** — if the platform wants extra fields (e.g.
-   `circuitVersion`, `proofReference`, Kurier job id) or different key
-   spellings, add them in `server.js`'s `finish(...)` calls. Keep the
-   primary shape (`decision`, `proof`, `publicSignals`, `taskId`) intact.
-3. **Proof submission** — the current endpoint returns the proof to the
-   platform for it to verify. If practice shows the agent must instead
-   submit the proof to Kurier/zkVerify itself and return a `proofReference`,
-   that submission step belongs in `handleTask` after proving (Kurier key
-   via env, same secret-file pattern as the HMAC secret).
-4. **taskId format** — if taskIds are non-numeric (UUIDs etc.), the circuit
-   input can't carry them; the current code then answers decision 0 without
-   a proof. If that happens, decide with the coordinator whether to hash
-   the taskId into a field element or to echo it only.
+1. **taskId mapping** — the platform may or may not check the taskId
+   public signal against the task id. Currently SHA-256 mod p. If practice
+   rejects proofs, try keccak256 (needs a vendored impl or a Python
+   subprocess — pycryptodome is available) or a plain numeric mapping.
+2. **Kurier / proof_tx** — the response proof is the scored evidence;
+   `proof_tx` is documented as an optional audit pointer, so Kurier
+   submission is currently NOT done. If practice shows a proof reference
+   is required for scoring, add a Kurier submit step after proving
+   (Kurier key via env, same secret-file pattern as the HMAC secret) —
+   that needs lapet's email for the Kurier account.
